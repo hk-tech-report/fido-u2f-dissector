@@ -1,4 +1,10 @@
--- started based on https://gist.github.com/z4yx/218116240e2759759b239d16fed787ca
+-- originally taken from: https://gist.github.com/woodrow/cb1496975e131e37d5dd716127a250a4
+-- (which itself was started based on https://gist.github.com/z4yx/218116240e2759759b239d16fed787ca)
+--
+-- modifications:
+-- - ties request into response and (displaying message type on response)
+-- - supports decoding of u2f messages into fields
+-- - correctly show position of status code
 
 cbor = Dissector.get("cbor")
 iso7816 = Dissector.get("iso7816")
@@ -64,14 +70,6 @@ CTAPHID_COMMAND_STRINGS = {
     [0x04] = 'CTAPHID_LOCK',
 	[0x40] = 'VENDOR_FIRST',
 	[0x7F] = 'VENDOR_LAST',
-}
-
-U2F_INS_STRINGS = {
-    [0x01] = 'U2F_REGISTER',
-    [0x02] = 'U2F_AUTHENTICATE',
-    [0x03] = 'U2F_VERSION',
-	[0x40] = 'VENDOR_FIRST',
-	[0xBF] = 'VENDOR_LAST'
 }
 
 U2F_STATUS_STRINGS = {
@@ -210,12 +208,26 @@ function u2f_command_label(cmd, abbrev)
 		abbrev = false
 	end
 	local command_string = U2F_INS_STRINGS[cmd]
+	if command_string ~= nil then
+		command_string = command_string[1]
+	end
 	if command_string ~= nil and not abbrev then
 		command_string = command_string .. string.format(" (0x%02x)", cmd)
 	elseif command_string == nil then
 		command_string =  string.format("0x%02x", cmd)
 	end
 	return command_string
+end
+
+function u2f_payload_decoder(cmd, is_request)
+	local command = U2F_INS_STRINGS[cmd]
+	if command == nil then
+		return nil
+	end
+	if is_request then
+		return command[2]
+	end
+	return command[3]
 end
 
 function u2f_status_label(status, abbrev)
@@ -265,6 +277,37 @@ function dump(o)
    end
 end
 
+command_state = {}
+function lookup_command_state(pinfo)
+	-- lua dissectors have no conversation! what a pain
+	-- nasty hack
+	-- TODO: include channel_id / channel state key
+
+	local pos = pinfo.number
+	while true
+	do
+		pos = pos - 1
+		if pos == 0 then
+			return nil
+		end
+		local c = command_state[pos]
+		if c ~= nil then
+			return c
+		end
+		
+	end
+end
+
+function create_command_state(pinfo)
+--	print(packet_state[pinfo.number].channel_id)
+	local cstate = command_state[pinfo.number]
+	if cstate == nil then
+		cstate = {}
+		command_state[pinfo.number] = cstate
+	end
+	return cstate
+end
+
 function u2f_proto.dissector(buffer,pinfo,tree)
 	if buffer:len() == 0 then return end -- && usb.function == 0x0008 && select correct endpoint/etc.
 	print("u2f_before", pinfo.curr_proto)
@@ -273,7 +316,9 @@ function u2f_proto.dissector(buffer,pinfo,tree)
 	local subtree = tree:add(ctaphid_proto,buffer(),"CTAP1/U2F")
 	local is_request = (field_usb_endpointdir().value == 0)
 	if is_request then -- this is a request
+		local cmdstate = create_command_state(pinfo)
 		local u2f_command = buffer(1,1):uint()
+		cmdstate.u2f_command = u2f_command
 		subtree:append_text(" Request")
 		pinfo.cols.info = "U2F Request (" .. u2f_command_label(u2f_command, true) .. ")"
 		subtree:add(u2ffield_cla, buffer(0,1))
@@ -282,14 +327,27 @@ function u2f_proto.dissector(buffer,pinfo,tree)
 		subtree:add(u2ffield_p2, buffer(3,1))
 		local request_length = buffer(4,3):uint()
 		subtree:add(u2ffield_reqlen, buffer(4,3))
-		subtree:add(u2ffield_reqdata, buffer(7, request_length))
+		local payload = buffer(7, request_length)
+		subtree:add(u2ffield_reqdata, payload)
+
+		local payload_decoder = u2f_payload_decoder(u2f_command, true)
+		if payload_decoder then
+			payload_decoder(payload, pinfo, tree)
+		end
 	else -- response
+		local cmdstate = lookup_command_state(pinfo)
 		local u2f_status = buffer(buffer:len()-2,2):uint()
 		subtree:append_text(" Response")
-		pinfo.cols.info = "U2F Response (" .. u2f_status_label(u2f_status, true) .. ")"
-		subtree:add(u2ffield_status, u2f_status, u2f_status, "Status: " .. u2f_status_label(u2f_status))
+		pinfo.cols.info = "U2F Response (" .. u2f_status_label(u2f_status, true) .. ") [" .. u2f_command_label(cmdstate.u2f_command)  .. "]"
+		subtree:add(u2ffield_status, buffer(buffer:len()-2,2), u2f_status, "Status: " .. u2f_status_label(u2f_status))
 		if buffer:len() > 2 then
-		subtree:add(u2ffield_respdata, buffer(0, buffer:len()-2))
+			local payload = buffer(0, buffer:len()-2)
+			subtree:add(u2ffield_respdata, payload)
+
+			local payload_decoder = u2f_payload_decoder(cmdstate.u2f_command, false)
+			if payload_decoder then
+				payload_decoder(payload, pinfo, tree)
+			end
 		end
 	end
 	return true
@@ -329,6 +387,7 @@ function ctaphid_proto.dissector(buffer,pinfo,tree)
 	local cstate = nil
 	if pstate == nil then
 		pstate = {}
+		pstate.channel_id = channel_id
 		cstate = channel_state[channel_state_key(channel_id)]
 		if cstate == nil then
 			assert(is_init_packet)
@@ -382,7 +441,117 @@ function ctaphid_proto.dissector(buffer,pinfo,tree)
 	return
 end
 
+u2f_register_request_proto = Proto("u2f_register_request","Register Request")
+u2f_register_request_proto_challenge_param = ProtoField.bytes("u2f_register_request.challenge_param", "Challenge parameter")
+u2f_register_request_proto_application_param = ProtoField.bytes("u2f_register_request.application_param", "Application parameter")
+u2f_register_request_proto.fields = { u2f_register_request_proto_challenge_param, u2f_register_request_proto_application_param }
+
+u2f_register_response_proto = Proto("u2f_register_response","Register Response")
+u2f_register_response_proto_reserved_byte = ProtoField.bytes("u2f_register_response.challenge_param", "Reserved byte")
+u2f_register_response_proto_user_public_key = ProtoField.bytes("u2f_register_response.user_public_key", "User public key")
+u2f_register_response_proto_key_handle_length = ProtoField.uint8("u2f_register_response.key_handle_length", "Key handle length")
+u2f_register_response_proto_key_handle = ProtoField.bytes("u2f_register_response.key_handle", "Key handle")
+u2f_register_response_proto_attestation_certificate = ProtoField.bytes("u2f_register_response_proto_attestation_certificate", "Attestation certificate") -- asn.1 (der) encoded
+u2f_register_response_proto_signature = ProtoField.bytes("u2f_register_response.signature", "Signature") -- asn.1 (der) encoded
+u2f_register_response_proto.fields = { u2f_register_response_proto_reserved_byte, u2f_register_response_proto_user_public_key, u2f_register_response_proto_key_handle_length, u2f_register_response_proto_key_handle, u2f_register_response_proto_attestation_certificate, u2f_register_response_proto_signature }
+
+u2f_authenticate_request_proto = Proto("u2f_authenticate_request","Authenticate Request")
+u2f_authenticate_request_proto_challenge_param = ProtoField.bytes("u2f_authenticate_request.challenge_param", "Challenge parameter")
+u2f_authenticate_request_proto_application_param = ProtoField.bytes("u2f_authenticate_request.application_param", "Application parameter")
+u2f_authenticate_request_proto_key_handle_length = ProtoField.uint8("u2f_authenticate_request.key_handle_length", "Key handle length")
+u2f_authenticate_request_proto_key_handle = ProtoField.bytes("u2f_authenticate_request.key_handle", "Key handle")
+u2f_authenticate_request_proto.fields = { u2f_authenticate_request_proto_challenge_param, u2f_authenticate_request_proto_application_param, u2f_authenticate_request_proto_key_handle_length, u2f_authenticate_request_proto_key_handle }
+
+u2f_authenticate_response_proto = Proto("u2f_authenticate_response","Authenticate Response")
+u2f_authenticate_response_proto_user_presence = ProtoField.uint8("u2f_authenticate_response.user_presence", "User presence")
+u2f_authenticate_response_proto_counter = ProtoField.uint32("u2f_authenticate_response.counter", "Counter")
+u2f_authenticate_response_proto_signature = ProtoField.bytes("u2f_authenticate_response.signature", "Signature") -- asn.1 (der) encoded
+u2f_authenticate_response_proto.fields = { u2f_authenticate_response_proto_user_presence, u2f_authenticate_response_proto_counter, u2f_authenticate_response_proto_signature }
+
+-- includes the sequence header size
+function decode_asn1_sequence_length(buffer, pos)
+	if buffer(pos,1):uint() ~= 48 then
+		return false, "not asn.1 sequence"
+	end
+	-- https://docs.microsoft.com/en-us/windows/win32/seccertenroll/about-encoded-length-and-value-bytes
+	local fb = buffer(pos+1,1):uint()
+	if fb <= 127 then
+		return true, fb + 2
+	end
+	-- we only handle 1 and 2 (easy enough to expand to more if needed)
+	if fb == 130 then -- 0x82 (meaning 0x80 | 2 length bytes)
+		return true, buffer(pos+2,2):uint() + 4
+	end
+	return false, "unknown length of bits"
+end
+
+function decode_u2f_register_request(buffer,pinfo,tree)
+	local subtree = tree:add(u2f_register_request_proto, buffer())
+	subtree:set_text("U2F Register Request")
+	subtree:add(u2f_register_request_proto_challenge_param, buffer(0,32))
+	subtree:add(u2f_register_request_proto_application_param, buffer(32,32))
+end
+
+function decode_u2f_register_response(buffer,pinfo,tree)
+	local subtree = tree:add(u2f_register_response_proto, buffer())
+	subtree:set_text("U2F Register Response")
+	subtree:add(u2f_register_response_proto_reserved_byte, buffer(0,1))
+	subtree:add(u2f_register_response_proto_user_public_key, buffer(1,65))
+	subtree:add(u2f_register_response_proto_key_handle_length, buffer(66,1))
+	local key_handle_length = buffer(66,1):uint()
+	subtree:add(u2f_register_response_proto_key_handle, buffer(67,key_handle_length))
+
+	local att_start = 67+key_handle_length
+	local success, att_len = decode_asn1_sequence_length(buffer, att_start)
+	if not success then
+		subtree:set_text("FAILED DECODING " .. att_len)
+		return
+	end
+	subtree:add(u2f_register_response_proto_attestation_certificate, buffer(att_start,att_len))
+	local sig_start = att_start+att_len
+	local success, sig_len = decode_asn1_sequence_length(buffer, sig_start)
+	if not success or sig_len ~= buffer:len()-sig_start then
+		subtree:set_text("FAILED DECODING (2) " .. sig_len)
+		return
+	end
+	subtree:add(u2f_register_response_proto_signature, buffer(sig_start,sig_len))
+end
+
+function decode_u2f_auth_request(buffer,pinfo,tree)
+	local subtree = tree:add(u2f_authenticate_request_proto, buffer())
+	subtree:set_text("U2F Authenticate Request")
+	subtree:add(u2f_authenticate_request_proto_challenge_param, buffer(0,32))
+	subtree:add(u2f_authenticate_request_proto_application_param, buffer(32,32))
+	subtree:add(u2f_authenticate_request_proto_key_handle_length, buffer(64,1))
+	local key_handle_length = buffer(64,1):uint()
+	subtree:add(u2f_authenticate_request_proto_key_handle, buffer(65,key_handle_length))
+end
+
+function decode_u2f_auth_response(buffer,pinfo,tree)
+	local subtree = tree:add(u2f_authenticate_response_proto, buffer())
+	subtree:set_text("U2F Authenticate Response")
+	subtree:add(u2f_authenticate_response_proto_user_presence, buffer(0,1))
+	subtree:add(u2f_authenticate_response_proto_counter, buffer(1,4))
+	local sig_start = 5
+	local success, sig_len = decode_asn1_sequence_length(buffer, sig_start)
+	if not success or sig_len ~= buffer:len()-sig_start then
+		subtree:set_text("FAILED DECODING " .. sig_len)
+		return
+	end
+
+	subtree:add(u2f_authenticate_response_proto_signature, buffer(sig_start, sig_len))
+end
+
+U2F_INS_STRINGS = {
+    [0x01] = {'U2F_REGISTER', decode_u2f_register_request, decode_u2f_register_response},
+    [0x02] = {'U2F_AUTHENTICATE', decode_u2f_auth_request, decode_u2f_auth_response},
+    [0x03] = {'U2F_VERSION', nil, nil},
+    [0x40] = {'VENDOR_FIRST', nil, nil},
+    [0xBF] = {'VENDOR_LAST', nil, nil},
+}
+
 usb_table = DissectorTable.get("usb.product")
 usb_table:add(0x10500407,ctaphid_proto) -- VID/PID of Yubikey
 usb_table:add(0x096e0858,ctaphid_proto) -- VID/PID of Feitian key
+usb_table:add(0x10500406,ctaphid_proto) -- VID/PID of Yubikey
 usb_table:add_for_decode_as(u2f_proto)
