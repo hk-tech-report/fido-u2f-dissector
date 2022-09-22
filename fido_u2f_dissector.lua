@@ -5,6 +5,7 @@
 -- - ties request into response and (displaying message type on response)
 -- - supports decoding of u2f messages into fields
 -- - correctly show position of status code
+-- - display some fields also as base64
 
 cbor = Dissector.get("cbor")
 iso7816 = Dissector.get("iso7816")
@@ -141,6 +142,56 @@ CTAP_RESPONSE_CODE = {
     [0xF0]='CTAP2_ERR_VENDOR_FIRST',
     [0xFF]='CTAP2_ERR_VENDOR_LAST'
 }
+
+
+
+
+-- from https://lua-users.org/wiki/BaseSixtyFour
+-- Lua 5.1+ base64 v3.0 (c) 2009 by Alex Kloss <alexthkloss@web.de>
+-- licensed under the terms of the LGPL2
+
+local b64='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+-- encoding
+function b64enc(data)
+    return ((data:gsub('.', function(x) 
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b64:sub(c+1,c+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+
+
+-- decoding
+function b64dec(data)
+    data = string.gsub(data, '[^'..b64..'=]', '')
+    return (data:gsub('.', function(x)
+        if (x == '=') then return '' end
+        local r,f='',(b64:find(x)-1)
+        for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+        if (#x ~= 8) then return '' end
+        local c=0
+        for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end
+        return string.char(c)
+    end))
+end
+
+
+
+
+
+
+
+
+
+
 
 function dissect_ctaphid_payload(cmd, buffer, pinfo, tree)
 	if buffer:len() == 0 then return end -- && usb.function == 0x0008 && select correct endpoint/etc.
@@ -451,16 +502,18 @@ u2f_register_response_proto_reserved_byte = ProtoField.bytes("u2f_register_respo
 u2f_register_response_proto_user_public_key = ProtoField.bytes("u2f_register_response.user_public_key", "User public key")
 u2f_register_response_proto_key_handle_length = ProtoField.uint8("u2f_register_response.key_handle_length", "Key handle length")
 u2f_register_response_proto_key_handle = ProtoField.bytes("u2f_register_response.key_handle", "Key handle")
+u2f_register_response_proto_key_handle_base64 = ProtoField.string("u2f_register_response.key_handle_base64", "As base64")
 u2f_register_response_proto_attestation_certificate = ProtoField.bytes("u2f_register_response_proto_attestation_certificate", "Attestation certificate") -- asn.1 (der) encoded
 u2f_register_response_proto_signature = ProtoField.bytes("u2f_register_response.signature", "Signature") -- asn.1 (der) encoded
-u2f_register_response_proto.fields = { u2f_register_response_proto_reserved_byte, u2f_register_response_proto_user_public_key, u2f_register_response_proto_key_handle_length, u2f_register_response_proto_key_handle, u2f_register_response_proto_attestation_certificate, u2f_register_response_proto_signature }
+u2f_register_response_proto.fields = { u2f_register_response_proto_reserved_byte, u2f_register_response_proto_user_public_key, u2f_register_response_proto_key_handle_length, u2f_register_response_proto_key_handle, u2f_register_response_proto_key_handle_base64, u2f_register_response_proto_attestation_certificate, u2f_register_response_proto_signature }
 
 u2f_authenticate_request_proto = Proto("u2f_authenticate_request","Authenticate Request")
 u2f_authenticate_request_proto_challenge_param = ProtoField.bytes("u2f_authenticate_request.challenge_param", "Challenge parameter")
 u2f_authenticate_request_proto_application_param = ProtoField.bytes("u2f_authenticate_request.application_param", "Application parameter")
 u2f_authenticate_request_proto_key_handle_length = ProtoField.uint8("u2f_authenticate_request.key_handle_length", "Key handle length")
 u2f_authenticate_request_proto_key_handle = ProtoField.bytes("u2f_authenticate_request.key_handle", "Key handle")
-u2f_authenticate_request_proto.fields = { u2f_authenticate_request_proto_challenge_param, u2f_authenticate_request_proto_application_param, u2f_authenticate_request_proto_key_handle_length, u2f_authenticate_request_proto_key_handle }
+u2f_authenticate_request_proto_key_handle_base64 = ProtoField.string("u2f_authenticate_request.key_handle", "As base64")
+u2f_authenticate_request_proto.fields = { u2f_authenticate_request_proto_challenge_param, u2f_authenticate_request_proto_application_param, u2f_authenticate_request_proto_key_handle_length, u2f_authenticate_request_proto_key_handle, u2f_authenticate_request_proto_key_handle_base64 }
 
 u2f_authenticate_response_proto = Proto("u2f_authenticate_response","Authenticate Response")
 u2f_authenticate_response_proto_user_presence = ProtoField.uint8("u2f_authenticate_response.user_presence", "User presence")
@@ -499,7 +552,9 @@ function decode_u2f_register_response(buffer,pinfo,tree)
 	subtree:add(u2f_register_response_proto_user_public_key, buffer(1,65))
 	subtree:add(u2f_register_response_proto_key_handle_length, buffer(66,1))
 	local key_handle_length = buffer(66,1):uint()
-	subtree:add(u2f_register_response_proto_key_handle, buffer(67,key_handle_length))
+
+	local key_handle_tree = subtree:add(u2f_register_response_proto_key_handle, buffer(67,key_handle_length))
+	key_handle_tree:add(u2f_register_response_proto_key_handle_base64, buffer(67,key_handle_length), b64enc(buffer:raw(67, key_handle_length)))
 
 	local att_start = 67+key_handle_length
 	local success, att_len = decode_asn1_sequence_length(buffer, att_start)
@@ -524,7 +579,9 @@ function decode_u2f_auth_request(buffer,pinfo,tree)
 	subtree:add(u2f_authenticate_request_proto_application_param, buffer(32,32))
 	subtree:add(u2f_authenticate_request_proto_key_handle_length, buffer(64,1))
 	local key_handle_length = buffer(64,1):uint()
-	subtree:add(u2f_authenticate_request_proto_key_handle, buffer(65,key_handle_length))
+
+	local key_handle_tree = subtree:add(u2f_authenticate_request_proto_key_handle, buffer(65,key_handle_length))
+	key_handle_tree:add(u2f_authenticate_request_proto_key_handle_base64, buffer(65,key_handle_length), b64enc(buffer:raw(65+7, key_handle_length)))
 end
 
 function decode_u2f_auth_response(buffer,pinfo,tree)
